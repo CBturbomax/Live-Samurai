@@ -384,6 +384,13 @@ const el=id=>document.getElementById(id),MODEL='models/gemini-3.5-live-translate
 const url='wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
 let alive=false,connected=false,ws=null,stream=null,ctx=null,src=null,proc=null,silent=null,recorder=null,chunks=[],audioBlob=null,cap=[],current=null,started=0,timer=0,pending=[],left=0,nextSound=0;
 let micTesting=false,displayStream=null,testingAPI=false,serverKey=false;
+let wakeLock=null;
+// Keep the screen (and so the laptop) awake while a session is running.
+async function keepAwake(){
+ if(!alive||wakeLock||!navigator.wakeLock||document.hidden)return;
+ try{const lock=await navigator.wakeLock.request('screen');lock.addEventListener('release',()=>{if(wakeLock===lock)wakeLock=null;});if(alive)wakeLock=lock;else lock.release().catch(()=>{});}catch(e){console.warn('Wake lock:',e);}
+}
+function allowSleep(){const lock=wakeLock;wakeLock=null;lock?.release().catch(()=>{});}
 function socketUrl(key){return serverKey?(location.protocol==='https:'?'wss://':'ws://')+location.host+'/live':url+'?key='+encodeURIComponent(key);}
 const KEY_STORAGE='ir-live-gemini-api-key-v1';
 function keyMessage(s,bad=false){el('keystate').textContent=s;el('keystate').className='micstate'+(bad?' warn':' ok');}
@@ -542,7 +549,7 @@ function recordTranslation(text){
 }
 function b64(bytes){let s='';for(let j=0;j<bytes.length;j+=8192)s+=String.fromCharCode.apply(null,bytes.subarray(j,j+8192));return btoa(s);}
 function play(base64){if(!ctx||!el('voice').checked)return;try{const x=atob(base64),count=Math.floor(x.length/2);if(!count)return;const b=ctx.createBuffer(1,count,24000),a=b.getChannelData(0);for(let i=0;i<count;i++){let v=x.charCodeAt(i*2)|(x.charCodeAt(i*2+1)<<8);if(v>32767)v-=65536;a[i]=v/32768;}const s=ctx.createBufferSource();s.buffer=b;s.connect(ctx.destination);nextSound=Math.max(ctx.currentTime+.05,nextSound);if(nextSound>ctx.currentTime+2)nextSound=ctx.currentTime+.05;s.start(nextSound);nextSound+=b.duration;}catch(e){console.warn(e);}}
-function audioSetup(){src=ctx.createMediaStreamSource(stream);proc=ctx.createScriptProcessor(4096,1,1);silent=ctx.createGain();silent.gain.value=0;src.connect(proc);proc.connect(silent);silent.connect(ctx.destination);proc.onaudioprocess=e=>{const input=e.inputBuffer.getChannelData(0),step=ctx.sampleRate/16000;let p=left;for(;p<input.length;p+=step){pending.push(Math.max(-1,Math.min(1,input[Math.floor(p)]||0)));if(pending.length>=1600){const buf=new ArrayBuffer(3200),dv=new DataView(buf);for(let i=0;i<1600;i++){let v=pending[i];dv.setInt16(i*2,v<0?v*32768:v*32767,true);}pending=[];if(connected&&ws?.readyState===WebSocket.OPEN&&ws.bufferedAmount<800000)ws.send(JSON.stringify({realtimeInput:{audio:{data:b64(new Uint8Array(buf)),mimeType:'audio/pcm;rate=16000'}}}));}}left=p<input.length?p:p-input.length;};}
+function audioSetup(){src=ctx.createMediaStreamSource(stream);proc=ctx.createScriptProcessor(4096,1,1);silent=ctx.createGain();silent.gain.value=0;src.connect(proc);proc.connect(silent);silent.connect(ctx.destination);proc.onaudioprocess=e=>{if(!ctx)return;const input=e.inputBuffer.getChannelData(0),step=ctx.sampleRate/16000;let p=left;for(;p<input.length;p+=step){pending.push(Math.max(-1,Math.min(1,input[Math.floor(p)]||0)));if(pending.length>=1600){const buf=new ArrayBuffer(3200),dv=new DataView(buf);for(let i=0;i<1600;i++){let v=pending[i];dv.setInt16(i*2,v<0?v*32768:v*32767,true);}pending=[];if(connected&&ws?.readyState===WebSocket.OPEN&&ws.bufferedAmount<800000)ws.send(JSON.stringify({realtimeInput:{audio:{data:b64(new Uint8Array(buf)),mimeType:'audio/pcm;rate=16000'}}}));}}left=p<input.length?p:p-input.length;};}
 function recordStart(){if(!el('rec').checked||!window.MediaRecorder)return;try{const type=['audio/mp4','audio/webm;codecs=opus','audio/webm'].find(x=>MediaRecorder.isTypeSupported(x));recorder=new MediaRecorder(stream,type?{mimeType:type}:undefined);chunks=[];audioBlob=null;recorder.ondataavailable=e=>{if(e.data.size)chunks.push(e.data);};recorder.onstop=()=>{audioBlob=new Blob(chunks,{type:recorder.mimeType||type||'audio/webm'});update();};recorder.start(5000);}catch(e){status('녹음 저장이 불가능하지만 통역은 진행합니다.',true);}}
 function setupPayload(){return {setup:{model:MODEL,generationConfig:{responseModalities:['AUDIO'],translationConfig:{targetLanguageCode:target(),echoTargetLanguage:true}},inputAudioTranscription:{},outputAudioTranscription:{}}};}
 function describeClose(e){
@@ -577,7 +584,7 @@ el('testapi').onclick=async()=>{
  finally{clearTimeout(timeout);try{testSocket?.close();}catch(e){}testingAPI=false;update();}
 };
 function connect(key){return new Promise((resolve,reject)=>{let ready=false;ws=new WebSocket(socketUrl(key));const timeout=setTimeout(()=>{if(!ready){ws?.close();reject(new Error('Gemini 연결 시간 초과'));}},15000);ws.onopen=()=>ws.send(JSON.stringify(setupPayload()));ws.onmessage=async e=>{try{const str=typeof e.data==='string'?e.data:await e.data.text(),m=JSON.parse(str);if(m.setupComplete){ready=true;connected=true;clearTimeout(timeout);status('LIVE · 마이크가 보내는 소리를 실시간 번역 중');resolve();}const c=m.serverContent;if(c){if(c.inputTranscription?.text)recordInput(c.inputTranscription.text,c.inputTranscription.languageCode||'');if(c.outputTranscription?.text)recordTranslation(c.outputTranscription.text);if(el('voice').checked&&c.modelTurn?.parts)c.modelTurn.parts.forEach(p=>{if(p.inlineData?.data)play(p.inlineData.data);});}if(m.goAway)status('세션 종료 예고 · 종료 후 다시 시작하세요',true);}catch(err){console.error(err);}};ws.onerror=()=>{if(ready)status('네트워크 또는 서버 연결 오류. 잠시 후 재시도하세요.',true);};ws.onclose=e=>{clearTimeout(timeout);connected=false;if(!ready)reject(new Error(describeClose(e)));else if(alive)status(describeClose(e)+' · 종료 후 다시 시작하세요',true);};});}
-async function stop(){alive=false;connected=false;clearInterval(timer);try{ws?.close();}catch(e){}ws=null;try{if(recorder?.state==='recording')recorder.stop();}catch(e){}try{proc?.disconnect();src?.disconnect();silent?.disconnect();}catch(e){}proc=src=silent=null;try{stream?.getTracks().forEach(t=>t.stop());displayStream?.getTracks().forEach(t=>t.stop());}catch(e){}stream=null;displayStream=null;try{await ctx?.close();}catch(e){}ctx=null;status('종료되었습니다 · 기록 저장 가능');update();}
+async function stop(){alive=false;connected=false;allowSleep();clearInterval(timer);try{ws?.close();}catch(e){}ws=null;try{if(recorder?.state==='recording')recorder.stop();}catch(e){}try{proc?.disconnect();src?.disconnect();silent?.disconnect();}catch(e){}proc=src=silent=null;try{stream?.getTracks().forEach(t=>t.stop());displayStream?.getTracks().forEach(t=>t.stop());}catch(e){}stream=null;displayStream=null;try{await ctx?.close();}catch(e){}ctx=null;status('종료되었습니다 · 기록 저장 가능');update();}
 el('start').onclick=async()=>{
  if(alive){await stop();return;}
  if(!navigator.mediaDevices?.getUserMedia&&!navigator.mediaDevices?.getDisplayMedia){
@@ -588,6 +595,7 @@ el('start').onclick=async()=>{
  status(el('source').value==='tab'?'Chrome 공유 창에서 전체 화면 + 시스템 오디오 공유 또는 Chrome 탭 + 탭 오디오 공유를 선택하세요.':'휴대폰 마이크를 연결 중입니다. 권한 요청이 뜨면 허용하세요.');
  try{
    stream=await acquireMic();
+   keepAwake();
    ctx=new(window.AudioContext||window.webkitAudioContext)();await ctx.resume();
    audioSetup();recordStart();timer=setInterval(()=>{const t=seconds();el('clock').textContent=t;el('stat-time').textContent=t;},500);
    if(!key&&!serverKey){
@@ -613,7 +621,7 @@ el('txt').onclick=()=>dl(new Blob([cap.map(c=>'['+c.time+'] 원문: '+c.original
 el('json').onclick=()=>dl(new Blob([JSON.stringify(cap.map(c=>({time:c.time,original:c.original,translation:c.translation})),null,2)],{type:'application/json'}),'Live-Samurai-'+new Date().toISOString().slice(0,10)+'.json');
 el('audio').onclick=()=>{if(audioBlob)dl(audioBlob,'Live-Samurai-audio.'+(audioBlob.type.includes('mp4')?'m4a':'webm'));};
 window.addEventListener('pagehide',()=>{ws?.close();stream?.getTracks().forEach(t=>t.stop());});
-document.addEventListener('visibilitychange',()=>{if(document.hidden&&alive)status('화면 잠금·백그라운드 전환 시 마이크가 중단될 수 있습니다.',true);});
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&alive)status('화면 잠금·백그라운드 전환 시 마이크가 중단될 수 있습니다.',true);else keepAwake();});
 if(navigator.mediaDevices?.addEventListener)navigator.mediaDevices.addEventListener('devicechange',refreshMics);
 autoSelectSource();
 refreshMics();

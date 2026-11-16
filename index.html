@@ -493,7 +493,7 @@ el('checkmic').onclick=async()=>{
 
 function target(){return 'ko';}
 function seconds(){let t=Math.floor((Date.now()-started)/1000);return [Math.floor(t/3600),Math.floor(t/60)%60,t%60].map(x=>String(x).padStart(2,'0')).join(':')}
-function update(){el('start').disabled=testingAPI;el('start').textContent=alive?'■ 녹음 종료':'● 녹음 · 통역 시작';el('start').classList.toggle('live-active',alive);el('stat-count').textContent=String(cap.length);el('testapi').disabled=alive||testingAPI;el('txt').disabled=!cap.length;el('json').disabled=!cap.length;el('audio').disabled=!audioBlob;}
+function update(){el('start').disabled=testingAPI;el('start').textContent=alive?'■ 녹음 종료':'● 녹음 · 통역 시작';el('start').classList.toggle('live-active',alive);el('testapi').disabled=alive||testingAPI;el('txt').disabled=!cap.length;el('json').disabled=!cap.length;el('audio').disabled=!audioBlob;}
 function join(a,b){if(!a)return b;if(a.endsWith(b))return a;if(b.startsWith(a))return b;return a+((/[a-zA-Z0-9]$/.test(a)&&/^[a-zA-Z0-9]/.test(b))?' ':'')+b;}
 function isKoreanTranscript(text,languageCode=''){
  const lang=String(languageCode||'').toLowerCase();

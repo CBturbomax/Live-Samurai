@@ -326,6 +326,9 @@ footer b{color:var(--a2)}
 .samurai-cards{grid-template-columns:repeat(3,minmax(0,1fr))}
 .section-heading{gap:8px}
 @media(max-width:720px){.samurai-cards{grid-template-columns:repeat(2,minmax(0,1fr))}.c-source{grid-column:span 2}}
+.glossary-section{grid-column:1/-1}
+.glossary-section textarea{width:100%;background:#0B1015;border:1px solid var(--line);border-radius:8px;color:var(--white);padding:10px 12px;font:inherit;font-size:14px;line-height:1.6;resize:vertical;outline:none}
+.glossary-section textarea:focus{border-color:var(--yellow)}
 </style>
 </head>
 <body>
@@ -370,7 +373,8 @@ footer b{color:var(--a2)}
 <p class="tip"><a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">무료 Gemini API 키 발급</a></p>
 <div class="advanced-actions"><button class="secondary" id="testapi" type="button">Gemini 연결 검사</button><button class="secondary" id="clear" type="button">기록 초기화</button></div>
 </div>
-<div class="settings-section toggles"><label class="check"><input id="rec" type="checkbox" checked> 원본 녹음 저장</label><label class="check"><input id="voice" type="checkbox"> 번역 음성도 재생</label></div>
+<div class="settings-section toggles"><label class="check"><input id="rec" type="checkbox" checked> 원본 녹음 저장</label><label class="check"><input id="voice" type="checkbox"> 번역 음성도 재생</label><label class="check"><input id="refine" type="checkbox" checked> 2차 번역으로 자막 다듬기 (✓ 표시)</label></div>
+<div class="settings-section glossary-section"><label class="field-label" for="glossary">용어집 · 선택 사항</label><textarea id="glossary" rows="4" spellcheck="false" placeholder="한 줄에 하나씩. 예)&#10;TSMC = TSMC&#10;CoWoS = 코워스&#10;gross margin = 매출총이익률"></textarea><p class="tip">회사명·제품명·업계 용어를 적어 두면 2차 번역이 그대로 따릅니다. 이 브라우저에 저장됩니다.</p></div>
 </div>
 </details>
 <details class="advanced files"><summary>↓ 미팅 기록 저장 <span>TXT · JSON · 녹음 파일</span></summary><div class="exportbar"><span class="export-label">SESSION EXPORT</span><button id="txt" disabled type="button">TXT 저장</button><button id="json" disabled type="button">JSON 저장</button><button id="audio" disabled type="button">녹음 파일 저장</button></div></details>
@@ -428,6 +432,10 @@ function consumeSetupKeyFromFragment(){
  return true;
 }
 restoreKey();
+const GLOSSARY_STORAGE='live-samurai-glossary-v1',REFINE_STORAGE='live-samurai-refine-v1';
+try{el('glossary').value=localStorage.getItem(GLOSSARY_STORAGE)||'';if(localStorage.getItem(REFINE_STORAGE)==='off')el('refine').checked=false;}catch(e){}
+el('glossary').addEventListener('input',()=>{try{localStorage.setItem(GLOSSARY_STORAGE,el('glossary').value.slice(0,2000));}catch(e){}});
+el('refine').addEventListener('change',()=>{try{localStorage.setItem(REFINE_STORAGE,el('refine').checked?'on':'off');}catch(e){}});
 const importedKey=consumeSetupKeyFromFragment();
 if(importedKey)keyMessage('✓ API 키 자동 연결 완료 · 다음부터 입력할 필요 없습니다.');
 try{if(!el('key').value.trim())el('advanced').open=true;}catch(e){}
@@ -518,33 +526,73 @@ function chooseKoreanCaption(original,translation,languageCode=''){
  if(isKoreanTranscript(original,languageCode))return original;
  return translation;
 }
+// ---- captions: live translation first, then a second-pass translation replaces it ----
+let idleTimer=0,refineOffUntil=0;
+function finalText(c){return c.korean?c.original:(c.refined&&c.refinedFor===c.original?c.refined:c.translation);}
+function render(c){
+ const done=!c.korean&&Boolean(c.refined)&&c.refinedFor===c.original;
+ c.org.textContent=c.original||'';
+ c.org.hidden=Boolean(c.korean);
+ c.tr.textContent=(c.korean?c.original:finalText(c))||(c.korean?'받아쓰는 중...':'통역 중...');
+ c.tr.classList.toggle('refined',done);
+ c.label.textContent=c.time+(done?' ✓':'');
+}
+function shouldSplit(kind,now){
+ if(!current||now-current.last>5000)return true;
+ if(kind!=='original'||current.korean)return false;
+ const o=current.original.trim();
+ // Start a new caption at a sentence end once the current one is long enough, so each one can be finalized.
+ return (o.length>=140&&/[.!?。！？…]["'”’)\]]?$/.test(o))||o.length>=450;
+}
+function closeEntry(c){if(!c||c.closed)return;c.closed=true;refine(c);}
+async function refine(c){
+ if(!c||c.korean||!el('refine').checked||Date.now()<refineOffUntil)return;
+ const key=el('key').value.trim();
+ if(!serverKey&&!key)return;
+ const sent=c.original;
+ if(sent.trim().length<12||c.refinedFor===sent||c.refining)return;
+ c.refining=true;
+ const i=cap.indexOf(c);
+ const context=cap.slice(Math.max(0,i-3),i).filter(x=>x.original).map(x=>({original:x.original,translation:finalText(x)}));
+ try{
+  const headers={'Content-Type':'application/json'};if(!serverKey)headers['x-gemini-key']=key;
+  const r=await fetch('/refine',{method:'POST',headers,body:JSON.stringify({text:sent,languageCode:c.languageCode,live:c.translation,context,glossary:el('glossary').value})});
+  if(r.status===429){refineOffUntil=Date.now()+60000;return;}       // quota: pause second pass for a minute, live captions continue
+  if(r.status===503){refineOffUntil=Date.now()+300000;return;}
+  if(!r.ok)throw new Error('HTTP '+r.status);
+  const d=await r.json();
+  if(d.translation&&cap.includes(c)){c.refined=d.translation;c.refinedFor=sent;render(c);update();}
+ }catch(e){console.warn('Refine:',e);}
+ finally{c.refining=false;if(c.closed&&c.original!==sent)refine(c);}
+}
 function add(kind,text){
  if(typeof text!=='string'||!text.trim())return;
  const now=Date.now();
- if(!current||now-current.last>5000){
-  current={time:seconds(),original:'',translation:'',last:now,korean:null,languageCode:''};
+ if(shouldSplit(kind,now)){
+  const prev=current;
+  current={time:seconds(),original:'',translation:'',last:now,korean:null,languageCode:'',refined:'',refinedFor:null,refining:false,closed:false};
   cap.push(current);el('empty')?.remove();
   const box=document.createElement('div');box.className='entry';
-  const time=document.createElement('div');time.className='label';time.textContent=current.time;
+  const time=document.createElement('div');time.className='label';
   const tr=document.createElement('div');tr.className='translation';
   const org=document.createElement('div');org.className='original';
-  box.append(time,tr,org);el('feed').append(box);current.org=org;current.tr=tr;
+  box.append(time,tr,org);el('feed').append(box);current.org=org;current.tr=tr;current.label=time;
+  closeEntry(prev);
  }
  current.last=now;current[kind]=join(current[kind],text);
- current.org.textContent=current.original||'';
- current.tr.textContent=chooseKoreanCaption(current.original,current.translation,current.languageCode)||(current.korean?'받아쓰는 중...':'통역 중...');
- current.org.hidden=Boolean(current.korean);
+ render(current);
+ const c=current;clearTimeout(idleTimer);idleTimer=setTimeout(()=>refine(c),2500); // a pause in speech: polish what we have
  el('feed').scrollTop=el('feed').scrollHeight;
  update();
 }
 function recordInput(text,languageCode=''){
  if(!text)return;
  const korean=isKoreanTranscript(text,languageCode);
- if(current&&current.korean!==null&&current.korean!==korean&&current.original.trim())current=null;
+ if(current&&current.korean!==null&&current.korean!==korean&&current.original.trim()){closeEntry(current);current=null;}
  add('original',text);
  current.korean=korean;current.languageCode=languageCode||'';
- if(korean){current.translation=current.original;current.tr.textContent=current.original;current.org.hidden=true;}
- else{current.org.hidden=false;current.tr.textContent=current.translation||'통역 중...';}
+ if(korean)current.translation=current.original;
+ render(current);
 }
 function recordTranslation(text){
  if(!text||current?.korean)return;
@@ -636,7 +684,7 @@ async function renew(){
  }
  if(mine===session)reconnecting=false;
 }
-async function stop(){alive=false;connected=false;reconnecting=false;backlog=[];session++;allowSleep();clearInterval(timer);try{ws?.close();}catch(e){}ws=null;try{if(recorder?.state==='recording')recorder.stop();}catch(e){}try{proc?.disconnect();src?.disconnect();silent?.disconnect();}catch(e){}proc=src=silent=null;try{stream?.getTracks().forEach(t=>t.stop());displayStream?.getTracks().forEach(t=>t.stop());}catch(e){}stream=null;displayStream=null;try{await ctx?.close();}catch(e){}ctx=null;status('종료되었습니다 · 기록 저장 가능');update();}
+async function stop(){clearTimeout(idleTimer);closeEntry(current);alive=false;connected=false;reconnecting=false;backlog=[];session++;allowSleep();clearInterval(timer);try{ws?.close();}catch(e){}ws=null;try{if(recorder?.state==='recording')recorder.stop();}catch(e){}try{proc?.disconnect();src?.disconnect();silent?.disconnect();}catch(e){}proc=src=silent=null;try{stream?.getTracks().forEach(t=>t.stop());displayStream?.getTracks().forEach(t=>t.stop());}catch(e){}stream=null;displayStream=null;try{await ctx?.close();}catch(e){}ctx=null;status('종료되었습니다 · 기록 저장 가능');update();}
 el('start').onclick=async()=>{
  if(alive){await stop();return;}
  if(!navigator.mediaDevices?.getUserMedia&&!navigator.mediaDevices?.getDisplayMedia){
@@ -669,8 +717,8 @@ el('start').onclick=async()=>{
 };
 el('clear').onclick=()=>{if(alive)return status('먼저 통역을 종료하세요.',true);cap=[];current=null;audioBlob=null;el('clock').textContent='00:00:00';el('stat-time').textContent='00:00:00';el('feed').innerHTML='<div class="empty" id="empty">새로운 미팅을 시작할 수 있습니다.</div>';update();};
 function dl(blob,name){const u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download=name;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),1500);}
-el('txt').onclick=()=>dl(new Blob([cap.map(c=>'['+c.time+'] 원문: '+c.original+'\n['+c.time+'] 번역: '+c.translation).join('\n\n')],{type:'text/plain;charset=utf-8'}),'Live-Samurai-'+new Date().toISOString().slice(0,10)+'.txt');
-el('json').onclick=()=>dl(new Blob([JSON.stringify(cap.map(c=>({time:c.time,original:c.original,translation:c.translation})),null,2)],{type:'application/json'}),'Live-Samurai-'+new Date().toISOString().slice(0,10)+'.json');
+el('txt').onclick=()=>dl(new Blob([cap.map(c=>'['+c.time+'] 원문: '+c.original+'\n['+c.time+'] 번역: '+finalText(c)).join('\n\n')],{type:'text/plain;charset=utf-8'}),'Live-Samurai-'+new Date().toISOString().slice(0,10)+'.txt');
+el('json').onclick=()=>dl(new Blob([JSON.stringify(cap.map(c=>({time:c.time,original:c.original,translation:finalText(c),liveTranslation:c.translation})),null,2)],{type:'application/json'}),'Live-Samurai-'+new Date().toISOString().slice(0,10)+'.json');
 el('audio').onclick=()=>{if(audioBlob)dl(audioBlob,'Live-Samurai-audio.'+(audioBlob.type.includes('mp4')?'m4a':'webm'));};
 window.addEventListener('pagehide',()=>{ws?.close();stream?.getTracks().forEach(t=>t.stop());});
 document.addEventListener('visibilitychange',()=>{if(document.hidden&&alive)status('화면 잠금·백그라운드 전환 시 마이크가 중단될 수 있습니다.',true);else keepAwake();});

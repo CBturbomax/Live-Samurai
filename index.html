@@ -549,7 +549,7 @@ function recordTranslation(text){
 }
 function b64(bytes){let s='';for(let j=0;j<bytes.length;j+=8192)s+=String.fromCharCode.apply(null,bytes.subarray(j,j+8192));return btoa(s);}
 function play(base64){if(!ctx||!el('voice').checked)return;try{const x=atob(base64),count=Math.floor(x.length/2);if(!count)return;const b=ctx.createBuffer(1,count,24000),a=b.getChannelData(0);for(let i=0;i<count;i++){let v=x.charCodeAt(i*2)|(x.charCodeAt(i*2+1)<<8);if(v>32767)v-=65536;a[i]=v/32768;}const s=ctx.createBufferSource();s.buffer=b;s.connect(ctx.destination);nextSound=Math.max(ctx.currentTime+.05,nextSound);if(nextSound>ctx.currentTime+2)nextSound=ctx.currentTime+.05;s.start(nextSound);nextSound+=b.duration;}catch(e){console.warn(e);}}
-function audioSetup(){src=ctx.createMediaStreamSource(stream);proc=ctx.createScriptProcessor(4096,1,1);silent=ctx.createGain();silent.gain.value=0;src.connect(proc);proc.connect(silent);silent.connect(ctx.destination);proc.onaudioprocess=e=>{if(!ctx)return;const input=e.inputBuffer.getChannelData(0),step=ctx.sampleRate/16000;let p=left;for(;p<input.length;p+=step){pending.push(Math.max(-1,Math.min(1,input[Math.floor(p)]||0)));if(pending.length>=1600){const buf=new ArrayBuffer(3200),dv=new DataView(buf);for(let i=0;i<1600;i++){let v=pending[i];dv.setInt16(i*2,v<0?v*32768:v*32767,true);}pending=[];if(connected&&ws?.readyState===WebSocket.OPEN&&ws.bufferedAmount<800000)ws.send(JSON.stringify({realtimeInput:{audio:{data:b64(new Uint8Array(buf)),mimeType:'audio/pcm;rate=16000'}}}));}}left=p<input.length?p:p-input.length;};}
+function audioSetup(){src=ctx.createMediaStreamSource(stream);proc=ctx.createScriptProcessor(4096,1,1);silent=ctx.createGain();silent.gain.value=0;src.connect(proc);proc.connect(silent);silent.connect(ctx.destination);proc.onaudioprocess=e=>{if(!ctx)return;const input=e.inputBuffer.getChannelData(0),step=ctx.sampleRate/16000;let p=left;for(;p<input.length;p+=step){pending.push(Math.max(-1,Math.min(1,input[Math.floor(p)]||0)));if(pending.length>=1600){const buf=new ArrayBuffer(3200),dv=new DataView(buf);for(let i=0;i<1600;i++){let v=pending[i];dv.setInt16(i*2,v<0?v*32768:v*32767,true);}pending=[];sendAudio(JSON.stringify({realtimeInput:{audio:{data:b64(new Uint8Array(buf)),mimeType:'audio/pcm;rate=16000'}}}));}}left=p<input.length?p:p-input.length;};}
 function recordStart(){if(!el('rec').checked||!window.MediaRecorder)return;try{const type=['audio/mp4','audio/webm;codecs=opus','audio/webm'].find(x=>MediaRecorder.isTypeSupported(x));recorder=new MediaRecorder(stream,type?{mimeType:type}:undefined);chunks=[];audioBlob=null;recorder.ondataavailable=e=>{if(e.data.size)chunks.push(e.data);};recorder.onstop=()=>{audioBlob=new Blob(chunks,{type:recorder.mimeType||type||'audio/webm'});update();};recorder.start(5000);}catch(e){status('녹음 저장이 불가능하지만 통역은 진행합니다.',true);}}
 function setupPayload(){return {setup:{model:MODEL,generationConfig:{responseModalities:['AUDIO'],translationConfig:{targetLanguageCode:target(),echoTargetLanguage:true}},inputAudioTranscription:{},outputAudioTranscription:{}}};}
 function describeClose(e){
@@ -583,15 +583,64 @@ el('testapi').onclick=async()=>{
  }catch(e){finished=true;status('연결 검사 실패: '+(e.message||String(e)),true);}
  finally{clearTimeout(timeout);try{testSocket?.close();}catch(e){}testingAPI=false;update();}
 };
-function connect(key){return new Promise((resolve,reject)=>{let ready=false;ws=new WebSocket(socketUrl(key));const timeout=setTimeout(()=>{if(!ready){ws?.close();reject(new Error('Gemini 연결 시간 초과'));}},15000);ws.onopen=()=>ws.send(JSON.stringify(setupPayload()));ws.onmessage=async e=>{try{const str=typeof e.data==='string'?e.data:await e.data.text(),m=JSON.parse(str);if(m.setupComplete){ready=true;connected=true;clearTimeout(timeout);status('LIVE · 마이크가 보내는 소리를 실시간 번역 중');resolve();}const c=m.serverContent;if(c){if(c.inputTranscription?.text)recordInput(c.inputTranscription.text,c.inputTranscription.languageCode||'');if(c.outputTranscription?.text)recordTranslation(c.outputTranscription.text);if(el('voice').checked&&c.modelTurn?.parts)c.modelTurn.parts.forEach(p=>{if(p.inlineData?.data)play(p.inlineData.data);});}if(m.goAway)status('세션 종료 예고 · 종료 후 다시 시작하세요',true);}catch(err){console.error(err);}};ws.onerror=()=>{if(ready)status('네트워크 또는 서버 연결 오류. 잠시 후 재시도하세요.',true);};ws.onclose=e=>{clearTimeout(timeout);connected=false;if(!ready)reject(new Error(describeClose(e)));else if(alive)status(describeClose(e)+' · 종료 후 다시 시작하세요',true);};});}
-async function stop(){alive=false;connected=false;allowSleep();clearInterval(timer);try{ws?.close();}catch(e){}ws=null;try{if(recorder?.state==='recording')recorder.stop();}catch(e){}try{proc?.disconnect();src?.disconnect();silent?.disconnect();}catch(e){}proc=src=silent=null;try{stream?.getTracks().forEach(t=>t.stop());displayStream?.getTracks().forEach(t=>t.stop());}catch(e){}stream=null;displayStream=null;try{await ctx?.close();}catch(e){}ctx=null;status('종료되었습니다 · 기록 저장 가능');update();}
+// Gemini closes a live connection after roughly 10-15 minutes, so the session is renewed automatically.
+let reconnecting=false,backlog=[],liveKey='',session=0;
+function sendAudio(msg){
+ if(connected&&ws?.readyState===WebSocket.OPEN){if(ws.bufferedAmount<800000)ws.send(msg);}
+ else if(alive&&reconnecting){backlog.push(msg);if(backlog.length>300)backlog.shift();} // keep up to ~30s of audio while reconnecting
+}
+function handleServer(m,sock){
+ const c=m.serverContent;
+ if(c){if(c.inputTranscription?.text)recordInput(c.inputTranscription.text,c.inputTranscription.languageCode||'');if(c.outputTranscription?.text)recordTranslation(c.outputTranscription.text);if(el('voice').checked&&c.modelTurn?.parts)c.modelTurn.parts.forEach(p=>{if(p.inlineData?.data)play(p.inlineData.data);});}
+ if(m.goAway&&sock===ws)renew(); // server announced the end of this connection: open the next one before it drops
+}
+function openSocket(key){return new Promise((resolve,reject)=>{
+ let ready=false;const mine=session,sock=new WebSocket(socketUrl(key));
+ const timeout=setTimeout(()=>{if(!ready){try{sock.close();}catch(e){}reject(new Error('Gemini 연결 시간 초과'));}},15000);
+ sock.onopen=()=>sock.send(JSON.stringify(setupPayload()));
+ sock.onmessage=async e=>{try{
+  const str=typeof e.data==='string'?e.data:await e.data.text(),m=JSON.parse(str);
+  if(m.setupComplete&&!ready){
+   ready=true;clearTimeout(timeout);
+   if(!alive||mine!==session){try{sock.close();}catch(err){}reject(new Error('세션이 종료되었습니다'));return;}
+   const old=ws;ws=sock;connected=true;
+   for(const msg of backlog.splice(0))sock.send(msg);
+   if(old&&old!==sock)try{old.close();}catch(err){}
+   resolve();
+  }
+  handleServer(m,sock);
+ }catch(err){console.error(err);}};
+ sock.onerror=()=>{ /* A CloseEvent follows with the specific reason. */ };
+ sock.onclose=e=>{
+  clearTimeout(timeout);
+  if(!ready){reject(new Error(describeClose(e)));return;}
+  if(sock!==ws)return; // already replaced by a newer connection
+  connected=false;
+  if(alive)renew();
+ };
+});}
+function connect(key){liveKey=key;return openSocket(key);}
+async function renew(){
+ if(reconnecting||!alive)return;
+ reconnecting=true;const mine=session;let lastErr='';
+ for(let n=1;alive&&mine===session;n++){
+  const wait=n===1?0:Math.min(15000,500*2**(n-1));
+  if(wait)await new Promise(r=>setTimeout(r,wait));
+  if(!alive||mine!==session)break;
+  if(!connected)status('● 녹음 중 · 통역 연결이 끊겨 다시 연결하는 중 ('+n+'번째)'+(lastErr?' · '+lastErr:''),n>3);
+  try{await openSocket(liveKey);if(mine===session){reconnecting=false;status('● 녹음 및 실시간 한국어 통역 중');}return;}
+  catch(e){lastErr=e.message||String(e);}
+ }
+ if(mine===session)reconnecting=false;
+}
+async function stop(){alive=false;connected=false;reconnecting=false;backlog=[];session++;allowSleep();clearInterval(timer);try{ws?.close();}catch(e){}ws=null;try{if(recorder?.state==='recording')recorder.stop();}catch(e){}try{proc?.disconnect();src?.disconnect();silent?.disconnect();}catch(e){}proc=src=silent=null;try{stream?.getTracks().forEach(t=>t.stop());displayStream?.getTracks().forEach(t=>t.stop());}catch(e){}stream=null;displayStream=null;try{await ctx?.close();}catch(e){}ctx=null;status('종료되었습니다 · 기록 저장 가능');update();}
 el('start').onclick=async()=>{
  if(alive){await stop();return;}
  if(!navigator.mediaDevices?.getUserMedia&&!navigator.mediaDevices?.getDisplayMedia){
   status('이 기기에서는 마이크/탭 소리 녹음이 지원되지 않습니다. HTTPS의 Safari 또는 Chrome을 사용하세요.',true);return;
  }
  const key=el('key').value.trim();if(key)saveKey();
- alive=true;connected=false;started=Date.now();current=null;pending=[];left=0;audioBlob=null;update();
+ alive=true;connected=false;reconnecting=false;backlog=[];session++;started=Date.now();current=null;pending=[];left=0;audioBlob=null;update();
  status(el('source').value==='tab'?'Chrome 공유 창에서 전체 화면 + 시스템 오디오 공유 또는 Chrome 탭 + 탭 오디오 공유를 선택하세요.':'휴대폰 마이크를 연결 중입니다. 권한 요청이 뜨면 허용하세요.');
  try{
    stream=await acquireMic();

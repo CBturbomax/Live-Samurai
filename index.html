@@ -527,11 +527,18 @@ function chooseKoreanCaption(original,translation,languageCode=''){
  return translation;
 }
 // ---- captions: live translation first, then a second-pass translation replaces it ----
-let idleTimer=0,refineOffUntil=0;
+let idleTimer=0,refineOffUntil=0,audioLog=[]; // audioLog: the last ~90s of microphone audio, 100ms per item
+function audioClip(from,to){
+ const parts=audioLog.filter(a=>a.t>=from&&a.t-100<=to).slice(-450); // at most 45s
+ if(parts.length<10)return '';
+ const all=new Uint8Array(parts.length*3200);parts.forEach((a,i)=>all.set(a.d,i*3200));
+ return b64(all);
+}
+function finalOriginal(c){return (!c.korean&&c.refined&&c.refinedFor===c.original&&c.refinedOriginal)||c.original;}
 function finalText(c){return c.korean?c.original:(c.refined&&c.refinedFor===c.original?c.refined:c.translation);}
 function render(c){
  const done=!c.korean&&Boolean(c.refined)&&c.refinedFor===c.original;
- c.org.textContent=c.original||'';
+ c.org.textContent=(done&&c.refinedOriginal)||c.original||'';
  c.org.hidden=Boolean(c.korean);
  c.tr.textContent=(c.korean?c.original:finalText(c))||(c.korean?'받아쓰는 중...':'통역 중...');
  c.tr.classList.toggle('refined',done);
@@ -556,12 +563,12 @@ async function refine(c){
  const context=cap.slice(Math.max(0,i-3),i).filter(x=>x.original).map(x=>({original:x.original,translation:finalText(x)}));
  try{
   const headers={'Content-Type':'application/json'};if(!serverKey)headers['x-gemini-key']=key;
-  const r=await fetch('/refine',{method:'POST',headers,body:JSON.stringify({text:sent,languageCode:c.languageCode,live:c.translation,context,glossary:el('glossary').value})});
+  const r=await fetch('/refine',{method:'POST',headers,body:JSON.stringify({text:sent,languageCode:c.languageCode,live:c.translation,context,glossary:el('glossary').value,audio:audioClip(c.t0-4000,c.last+500)})});
   if(r.status===429){refineOffUntil=Date.now()+60000;return;}       // quota: pause second pass for a minute, live captions continue
   if(r.status===503){refineOffUntil=Date.now()+300000;return;}
   if(!r.ok)throw new Error('HTTP '+r.status);
   const d=await r.json();
-  if(d.translation&&cap.includes(c)){c.refined=d.translation;c.refinedFor=sent;render(c);update();}
+  if(d.translation&&cap.includes(c)){c.refined=d.translation;c.refinedOriginal=d.transcript||'';c.refinedFor=sent;render(c);update();}
  }catch(e){console.warn('Refine:',e);}
  finally{c.refining=false;if(c.closed&&c.original!==sent)refine(c);}
 }
@@ -570,7 +577,7 @@ function add(kind,text){
  const now=Date.now();
  if(shouldSplit(kind,now)){
   const prev=current;
-  current={time:seconds(),original:'',translation:'',last:now,korean:null,languageCode:'',refined:'',refinedFor:null,refining:false,closed:false};
+  current={time:seconds(),t0:now,original:'',translation:'',last:now,refinedOriginal:'',korean:null,languageCode:'',refined:'',refinedFor:null,refining:false,closed:false};
   cap.push(current);el('empty')?.remove();
   const box=document.createElement('div');box.className='entry';
   const time=document.createElement('div');time.className='label';
@@ -600,7 +607,7 @@ function recordTranslation(text){
 }
 function b64(bytes){let s='';for(let j=0;j<bytes.length;j+=8192)s+=String.fromCharCode.apply(null,bytes.subarray(j,j+8192));return btoa(s);}
 function play(base64){if(!ctx||!el('voice').checked)return;try{const x=atob(base64),count=Math.floor(x.length/2);if(!count)return;const b=ctx.createBuffer(1,count,24000),a=b.getChannelData(0);for(let i=0;i<count;i++){let v=x.charCodeAt(i*2)|(x.charCodeAt(i*2+1)<<8);if(v>32767)v-=65536;a[i]=v/32768;}const s=ctx.createBufferSource();s.buffer=b;s.connect(ctx.destination);nextSound=Math.max(ctx.currentTime+.05,nextSound);if(nextSound>ctx.currentTime+2)nextSound=ctx.currentTime+.05;s.start(nextSound);nextSound+=b.duration;}catch(e){console.warn(e);}}
-function audioSetup(){src=ctx.createMediaStreamSource(stream);proc=ctx.createScriptProcessor(4096,1,1);silent=ctx.createGain();silent.gain.value=0;src.connect(proc);proc.connect(silent);silent.connect(ctx.destination);proc.onaudioprocess=e=>{if(!ctx)return;const input=e.inputBuffer.getChannelData(0),step=ctx.sampleRate/16000;let p=left;for(;p<input.length;p+=step){const from=Math.floor(p),to=Math.min(input.length,Math.max(from+1,Math.floor(p+step)));let sum=0;for(let k=from;k<to;k++)sum+=input[k];pending.push(Math.max(-1,Math.min(1,sum/(to-from)||0)));if(pending.length>=1600){const buf=new ArrayBuffer(3200),dv=new DataView(buf);for(let i=0;i<1600;i++){let v=pending[i];dv.setInt16(i*2,v<0?v*32768:v*32767,true);}pending=[];sendAudio(JSON.stringify({realtimeInput:{audio:{data:b64(new Uint8Array(buf)),mimeType:'audio/pcm;rate=16000'}}}));}}left=p<input.length?p:p-input.length;};}
+function audioSetup(){src=ctx.createMediaStreamSource(stream);proc=ctx.createScriptProcessor(4096,1,1);silent=ctx.createGain();silent.gain.value=0;src.connect(proc);proc.connect(silent);silent.connect(ctx.destination);proc.onaudioprocess=e=>{if(!ctx)return;const input=e.inputBuffer.getChannelData(0),step=ctx.sampleRate/16000;let p=left;for(;p<input.length;p+=step){const from=Math.floor(p),to=Math.min(input.length,Math.max(from+1,Math.floor(p+step)));let sum=0;for(let k=from;k<to;k++)sum+=input[k];pending.push(Math.max(-1,Math.min(1,sum/(to-from)||0)));if(pending.length>=1600){const buf=new ArrayBuffer(3200),dv=new DataView(buf);for(let i=0;i<1600;i++){let v=pending[i];dv.setInt16(i*2,v<0?v*32768:v*32767,true);}pending=[];audioLog.push({t:Date.now(),d:new Uint8Array(buf)});if(audioLog.length>900)audioLog.shift();sendAudio(JSON.stringify({realtimeInput:{audio:{data:b64(new Uint8Array(buf)),mimeType:'audio/pcm;rate=16000'}}}));}}left=p<input.length?p:p-input.length;};}
 function recordStart(){if(!el('rec').checked||!window.MediaRecorder)return;try{const type=['audio/mp4','audio/webm;codecs=opus','audio/webm'].find(x=>MediaRecorder.isTypeSupported(x));recorder=new MediaRecorder(stream,type?{mimeType:type}:undefined);chunks=[];audioBlob=null;recorder.ondataavailable=e=>{if(e.data.size)chunks.push(e.data);};recorder.onstop=()=>{audioBlob=new Blob(chunks,{type:recorder.mimeType||type||'audio/webm'});update();};recorder.start(5000);}catch(e){status('녹음 저장이 불가능하지만 통역은 진행합니다.',true);}}
 function setupPayload(){return {setup:{model:MODEL,generationConfig:{responseModalities:['AUDIO'],translationConfig:{targetLanguageCode:target(),echoTargetLanguage:true}},inputAudioTranscription:{},outputAudioTranscription:{}}};}
 function describeClose(e){
@@ -691,7 +698,7 @@ el('start').onclick=async()=>{
   status('이 기기에서는 마이크/탭 소리 녹음이 지원되지 않습니다. HTTPS의 Safari 또는 Chrome을 사용하세요.',true);return;
  }
  const key=el('key').value.trim();if(key)saveKey();
- alive=true;connected=false;reconnecting=false;backlog=[];session++;started=Date.now();current=null;pending=[];left=0;audioBlob=null;update();
+ alive=true;connected=false;reconnecting=false;backlog=[];audioLog=[];session++;started=Date.now();current=null;pending=[];left=0;audioBlob=null;update();
  status(el('source').value==='tab'?'Chrome 공유 창에서 전체 화면 + 시스템 오디오 공유 또는 Chrome 탭 + 탭 오디오 공유를 선택하세요.':'마이크를 연결 중입니다. 권한 요청이 뜨면 허용하세요.');
  try{
    stream=await acquireMic();
@@ -717,8 +724,8 @@ el('start').onclick=async()=>{
 };
 el('clear').onclick=()=>{if(alive)return status('먼저 통역을 종료하세요.',true);cap=[];current=null;audioBlob=null;el('clock').textContent='00:00:00';el('stat-time').textContent='00:00:00';el('feed').innerHTML='<div class="empty" id="empty">새로운 미팅을 시작할 수 있습니다.</div>';update();};
 function dl(blob,name){const u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download=name;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),1500);}
-el('txt').onclick=()=>dl(new Blob([cap.map(c=>'['+c.time+'] 원문: '+c.original+'\n['+c.time+'] 번역: '+finalText(c)).join('\n\n')],{type:'text/plain;charset=utf-8'}),'Live-Samurai-'+new Date().toISOString().slice(0,10)+'.txt');
-el('json').onclick=()=>dl(new Blob([JSON.stringify(cap.map(c=>({time:c.time,original:c.original,translation:finalText(c),liveTranslation:c.translation})),null,2)],{type:'application/json'}),'Live-Samurai-'+new Date().toISOString().slice(0,10)+'.json');
+el('txt').onclick=()=>dl(new Blob([cap.map(c=>'['+c.time+'] 원문: '+finalOriginal(c)+'\n['+c.time+'] 번역: '+finalText(c)).join('\n\n')],{type:'text/plain;charset=utf-8'}),'Live-Samurai-'+new Date().toISOString().slice(0,10)+'.txt');
+el('json').onclick=()=>dl(new Blob([JSON.stringify(cap.map(c=>({time:c.time,original:finalOriginal(c),translation:finalText(c),liveOriginal:c.original,liveTranslation:c.translation})),null,2)],{type:'application/json'}),'Live-Samurai-'+new Date().toISOString().slice(0,10)+'.json');
 el('audio').onclick=()=>{if(audioBlob)dl(audioBlob,'Live-Samurai-audio.'+(audioBlob.type.includes('mp4')?'m4a':'webm'));};
 window.addEventListener('pagehide',()=>{ws?.close();stream?.getTracks().forEach(t=>t.stop());});
 const HIDDEN_NOTE='다른 창으로 전환됨 · 통역은 계속 진행 중입니다.';

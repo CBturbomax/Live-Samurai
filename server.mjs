@@ -33,9 +33,20 @@ const REFINE_SYSTEM = `You are a professional interpreter working at investor an
 - The transcript may contain recognition errors. Use the earlier segments and the glossary to fix obvious errors, but do not invent content.
 - Keep every number, unit, date, company name, product name and ticker exact. Follow the glossary when it gives a Korean term.
 - Do not summarize, add, omit or explain. If the segment ends mid-sentence, translate only what is there.
-- Output only the Korean translation of the current segment, with no quotes or labels.`;
+- Return JSON with two fields: "transcript" (the current segment in its original language with recognition errors corrected, filler words like "uh" removed) and "translation" (its Korean translation).`;
+const REFINE_AUDIO_NOTE = `[Audio]
+A recording of roughly this part of the meeting is attached. It may begin a few seconds before the current segment and include the end of the previous one. Listen to it to correct words, names, abbreviations and numbers that the speech recognizer got wrong in the current segment. The transcript defines where the segment begins and ends: do not transcribe or translate speech outside it.`;
+const REFINE_SCHEMA = { type: 'OBJECT', properties: { transcript: { type: 'STRING' }, translation: { type: 'STRING' } }, required: ['transcript', 'translation'] };
 
-function readJson(req, limit = 32 * 1024) {
+// 16 kHz mono 16-bit PCM -> WAV
+function wavFromPcm(pcm) {
+  const h = Buffer.alloc(44);
+  h.write('RIFF', 0); h.writeUInt32LE(36 + pcm.length, 4); h.write('WAVEfmt ', 8); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22);
+  h.writeUInt32LE(16000, 24); h.writeUInt32LE(32000, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34); h.write('data', 36); h.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([h, pcm]);
+}
+
+function readJson(req, limit = 3 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     let size = 0; const parts = [];
     req.on('data', d => { size += d.length; if (size > limit) { reject(new Error('too large')); req.destroy(); } else parts.push(d); });
@@ -58,20 +69,35 @@ async function handleRefine(req, res) {
     if (!model) return send(503, { error: 'no model' });
     const context = (Array.isArray(body.context) ? body.context : []).slice(-3)
       .map(c => `원문: ${clip(c.original, 1500)}\n번역: ${clip(c.translation, 1500)}`).join('\n\n');
-    const prompt = [
+    let wav = '';
+    if (typeof body.audio === 'string' && body.audio.length > 4000 && body.audio.length < 2_600_000) {
+      const pcm = Buffer.from(body.audio, 'base64');
+      wav = wavFromPcm(pcm.subarray(0, pcm.length & ~1)).toString('base64');
+    }
+    const promptFor = withAudio => [
       body.glossary ? `[Glossary]\n${clip(body.glossary, 2000)}` : '',
       context ? `[Earlier segments, for context only]\n${context}` : '',
       body.live ? `[Rough live translation of the current segment, may be incomplete]\n${clip(body.live, 4000)}` : '',
-      `[Current segment${body.languageCode ? ' (' + clip(body.languageCode, 20) + ')' : ''}]\n${text}`,
+      withAudio ? REFINE_AUDIO_NOTE : '',
+      `[Current segment${body.languageCode ? ' (' + clip(body.languageCode, 20) + ')' : ''}, as recognized]\n${text}`,
     ].filter(Boolean).join('\n\n');
-    const r = await fetch(`${GEMINI_REST}/v1beta/${model}:generateContent`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, signal: AbortSignal.timeout(20000),
-      body: JSON.stringify({ systemInstruction: { parts: [{ text: REFINE_SYSTEM }] }, contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature: 0.2 } }),
+    const call = withAudio => fetch(`${GEMINI_REST}/v1beta/${model}:generateContent`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, signal: AbortSignal.timeout(25000),
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: REFINE_SYSTEM }] },
+        contents: [{ role: 'user', parts: [{ text: promptFor(withAudio) }, ...(withAudio ? [{ inlineData: { mimeType: 'audio/wav', data: wav } }] : [])] }],
+        generationConfig: { temperature: 0.2, responseMimeType: 'application/json', responseSchema: REFINE_SCHEMA },
+      }),
     });
+    let usedAudio = Boolean(wav), r = await call(usedAudio);
+    if (!r.ok && usedAudio && r.status !== 429) { // the audio attempt failed: fall back to the text-only second pass
+      console.error('Refine with audio failed:', r.status, clip(await r.text(), 300)); usedAudio = false; r = await call(false);
+    }
     if (!r.ok) { const detail = clip(await r.text(), 300); console.error('Refine failed:', r.status, detail); return send(r.status === 429 ? 429 : 502, { error: 'gemini ' + r.status, detail }); }
     const data = await r.json();
-    const translation = (data.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('').trim();
-    send(200, { translation, model });
+    const raw = (data.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('').trim();
+    let out; try { out = JSON.parse(raw); } catch { out = { translation: raw }; }
+    send(200, { translation: clip(out.translation, 6000).trim(), transcript: clip(out.transcript, 6000).trim(), model, usedAudio });
   } catch (err) { console.error('Refine error:', err.message); send(502, { error: String(err.message || err) }); }
 }
 

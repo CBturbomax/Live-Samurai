@@ -93,7 +93,7 @@ async function handleRefine(req, res) {
     if (!r.ok && usedAudio && r.status !== 429) { // the audio attempt failed: fall back to the text-only second pass
       console.error('Refine with audio failed:', r.status, clip(await r.text(), 300)); usedAudio = false; r = await call(false);
     }
-    if (!r.ok) { const detail = clip(await r.text(), 300); console.error('Refine failed:', r.status, detail); return send(r.status === 429 ? 429 : 502, { error: 'gemini ' + r.status, detail }); }
+    if (!r.ok) { const detail = clip(await r.text(), 1500); console.error('Refine failed:', r.status, detail); return send(r.status === 429 ? 429 : 502, { error: 'gemini ' + r.status, detail }); }
     const data = await r.json();
     const raw = (data.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('').trim();
     let out; try { out = JSON.parse(raw); } catch { out = { translation: raw }; }

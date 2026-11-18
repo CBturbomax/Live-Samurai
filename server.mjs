@@ -11,22 +11,27 @@ const GEMINI_URL = process.env.GEMINI_WS_URL || 'wss://generativelanguage.google
 const GEMINI_REST = (process.env.GEMINI_REST_URL || 'https://generativelanguage.googleapis.com').replace(/\/$/, '');
 
 // Second-pass translation: a text model re-translates each finished segment with context.
-const refineModels = new Map(); // api key -> Promise<model name | null>
-function pickRefineModel(key) {
-  if (process.env.GEMINI_REFINE_MODEL) return Promise.resolve(process.env.GEMINI_REFINE_MODEL.replace(/^(?!models\/)/, 'models/'));
+// Candidate models per api key, best first. A model that hits its quota is skipped until it recovers,
+// so the second pass keeps working on whichever model still has quota (the free tier allows few requests per day).
+const refineModels = new Map(); // api key -> Promise<string[]>
+const exhaustedUntil = new Map(); // model name -> timestamp
+function refineCandidates(key) {
+  if (process.env.GEMINI_REFINE_MODEL) return Promise.resolve(process.env.GEMINI_REFINE_MODEL.split(',').map(m => m.trim().replace(/^(?!models\/)/, 'models/')));
   if (!refineModels.has(key)) {
     refineModels.set(key, (async () => {
       const r = await fetch(GEMINI_REST + '/v1beta/models?pageSize=1000', { headers: { 'x-goog-api-key': key }, signal: AbortSignal.timeout(15000) });
       if (!r.ok) throw new Error('model list HTTP ' + r.status);
       const names = ((await r.json()).models || []).filter(m => (m.supportedGenerationMethods || []).includes('generateContent')).map(m => m.name);
-      // Prefer the newest stable Flash model (fast enough for captions), then a Flash preview, then Pro.
-      const newest = re => names.filter(n => re.test(n)).sort((a, b) => parseFloat(b.match(/gemini-([\d.]+)/)[1]) - parseFloat(a.match(/gemini-([\d.]+)/)[1]))[0];
-      return newest(/^models\/gemini-[\d.]+-flash$/) || newest(/^models\/gemini-[\d.]+-flash-preview$/) || newest(/^models\/gemini-[\d.]+-pro$/) || null;
-    })().catch(err => { console.error('Refine model lookup failed:', err.message); setTimeout(() => refineModels.delete(key), 60000); return null; }));
+      const version = n => parseFloat(n.match(/gemini-([\d.]+)/)[1]);
+      const tier = n => /-flash$/.test(n) ? 0 : /-flash-lite$/.test(n) ? 1 : 2; // 2 = preview builds
+      // Newest generation first; within a generation Flash, then Flash-Lite, then their previews.
+      return names.filter(n => /^models\/gemini-[\d.]+-flash(-lite)?(-preview)?$/.test(n)).sort((a, b) => version(b) - version(a) || tier(a) - tier(b)).slice(0, 8);
+    })().catch(err => { console.error('Refine model lookup failed:', err.message); setTimeout(() => refineModels.delete(key), 60000); return []; }));
   }
   return refineModels.get(key);
 }
-if (GEMINI_KEY) pickRefineModel(GEMINI_KEY).then(m => console.log('Refine model:', m));
+const available = models => models.filter(m => (exhaustedUntil.get(m) || 0) < Date.now());
+if (GEMINI_KEY) refineCandidates(GEMINI_KEY).then(m => console.log('Refine models:', m.join(', ')));
 
 const REFINE_SYSTEM = `You are a professional interpreter working at investor and company meetings. You receive one segment of a live speech-recognition transcript and must return its Korean translation.
 - Translate accurately and naturally, in the polite spoken register used in business meetings (합니다체/해요체).
@@ -65,8 +70,8 @@ async function handleRefine(req, res) {
     const body = await readJson(req);
     const text = clip(body.text, 4000).trim();
     if (!text) return send(400, { error: 'empty' });
-    const model = await pickRefineModel(key);
-    if (!model) return send(503, { error: 'no model' });
+    const candidates = await refineCandidates(key);
+    if (!candidates.length) return send(503, { error: 'no model' });
     const context = (Array.isArray(body.context) ? body.context : []).slice(-3)
       .map(c => `원문: ${clip(c.original, 1500)}\n번역: ${clip(c.translation, 1500)}`).join('\n\n');
     let wav = '';
@@ -81,7 +86,7 @@ async function handleRefine(req, res) {
       withAudio ? REFINE_AUDIO_NOTE : '',
       `[Current segment${body.languageCode ? ' (' + clip(body.languageCode, 20) + ')' : ''}, as recognized]\n${text}`,
     ].filter(Boolean).join('\n\n');
-    const call = withAudio => fetch(`${GEMINI_REST}/v1beta/${model}:generateContent`, {
+    const call = (model, withAudio) => fetch(`${GEMINI_REST}/v1beta/${model}:generateContent`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, signal: AbortSignal.timeout(25000),
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: REFINE_SYSTEM }] },
@@ -89,11 +94,21 @@ async function handleRefine(req, res) {
         generationConfig: { temperature: 0.2, responseMimeType: 'application/json', responseSchema: REFINE_SCHEMA },
       }),
     });
-    let usedAudio = Boolean(wav), r = await call(usedAudio);
-    if (!r.ok && usedAudio && r.status !== 429) { // the audio attempt failed: fall back to the text-only second pass
-      console.error('Refine with audio failed:', r.status, clip(await r.text(), 300)); usedAudio = false; r = await call(false);
+    let usedAudio = Boolean(wav), model = '', r = null, detail = '';
+    for (model of available(candidates)) {
+      usedAudio = Boolean(wav); r = await call(model, usedAudio);
+      if (!r.ok && usedAudio && r.status !== 429) { // the audio attempt failed: fall back to the text-only second pass
+        console.error('Refine with audio failed:', model, r.status, clip(await r.text(), 300)); usedAudio = false; r = await call(model, false);
+      }
+      if (r.ok) break;
+      detail = clip(await r.text(), 1500);
+      console.error('Refine failed:', model, r.status, clip(detail, 400));
+      if (r.status !== 429 && r.status !== 404 && r.status !== 503) break;
+      // Quota reached (or model unavailable): rest this model and try the next one. Daily limits rest for an hour, per-minute ones for a minute.
+      exhaustedUntil.set(model, Date.now() + (r.status === 429 && !/per day/i.test(detail) ? 60_000 : 3_600_000));
     }
-    if (!r.ok) { const detail = clip(await r.text(), 1500); console.error('Refine failed:', r.status, detail); return send(r.status === 429 ? 429 : 502, { error: 'gemini ' + r.status, detail }); }
+    if (!r) return send(429, { error: 'all models are over quota' });
+    if (!r.ok) return send(r.status === 429 ? 429 : 502, { error: 'gemini ' + r.status, model, detail });
     const data = await r.json();
     const raw = (data.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('').trim();
     let out; try { out = JSON.parse(raw); } catch { out = { translation: raw }; }
@@ -107,7 +122,7 @@ const server = http.createServer(async (req, res) => {
     res.end(html);
   } else if (req.url === '/config') {
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-    res.end(JSON.stringify({ serverKey: Boolean(GEMINI_KEY), refineModel: GEMINI_KEY ? await pickRefineModel(GEMINI_KEY) : null }));
+    res.end(JSON.stringify({ serverKey: Boolean(GEMINI_KEY), refineModels: GEMINI_KEY ? available(await refineCandidates(GEMINI_KEY)) : [] }));
   } else if (req.url === '/refine' && req.method === 'POST') {
     await handleRefine(req, res);
   } else if (req.url === '/health') {

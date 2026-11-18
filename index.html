@@ -721,7 +721,13 @@ el('txt').onclick=()=>dl(new Blob([cap.map(c=>'['+c.time+'] 원문: '+c.original
 el('json').onclick=()=>dl(new Blob([JSON.stringify(cap.map(c=>({time:c.time,original:c.original,translation:finalText(c),liveTranslation:c.translation})),null,2)],{type:'application/json'}),'Live-Samurai-'+new Date().toISOString().slice(0,10)+'.json');
 el('audio').onclick=()=>{if(audioBlob)dl(audioBlob,'Live-Samurai-audio.'+(audioBlob.type.includes('mp4')?'m4a':'webm'));};
 window.addEventListener('pagehide',()=>{ws?.close();stream?.getTracks().forEach(t=>t.stop());});
-document.addEventListener('visibilitychange',()=>{if(document.hidden&&alive)status('화면 잠금·백그라운드 전환 시 마이크가 중단될 수 있습니다.',true);else keepAwake();});
+const HIDDEN_NOTE='다른 창으로 전환됨 · 통역은 계속 진행 중입니다.';
+document.addEventListener('visibilitychange',()=>{
+ if(document.hidden){if(alive&&connected)status(HIDDEN_NOTE);return;}
+ keepAwake();
+ // Back on this tab: clear the note instead of leaving it up as if something had failed.
+ if(alive&&connected&&el('status').textContent===HIDDEN_NOTE)status('● 녹음 및 실시간 한국어 통역 중');
+});
 if(navigator.mediaDevices?.addEventListener)navigator.mediaDevices.addEventListener('devicechange',refreshMics);
 autoSelectSource();
 refreshMics();
